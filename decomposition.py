@@ -39,6 +39,37 @@ SEED_VISUALIZATION = 5
 B = 20
 n_clusters = 500
 
+
+from sklearn.decomposition import PCA
+import numpy as np
+
+class LatentDecomposition:
+    def __init__(self, model, n_components=10):
+        self.model = model
+        self.n_components = n_components
+        self.pca = PCA(n_components=n_components)
+
+    def fit(self, latents):
+        # Encode latents using the autoencoder
+        encoded_latents = self.model.encode_latents(latents)
+        self.pca.fit(encoded_latents)
+
+    def transform(self, latents):
+        encoded_latents = self.model.encode_latents(latents)
+        return self.pca.transform(encoded_latents)
+
+    def inverse_transform(self, transformed_latents):
+        decoded_latents = self.pca.inverse_transform(transformed_latents)
+        return self.model.decode_latents(decoded_latents)
+
+    def manipulate(self, latent, component_index, factor):
+        encoded_latent = self.model.encode_latents([latent])[0]
+        manipulated_encoded_latent = encoded_latent + factor * self.pca.components_[component_index]
+        manipulated_latent = self.model.decode_latents([manipulated_encoded_latent])[0]
+        return manipulated_latent
+
+
+
 def get_random_dirs(components, dimensions):
     gen = np.random.RandomState(seed=SEED_RANDOM_DIRS)
     dirs = gen.normal(size=(components, dimensions))
