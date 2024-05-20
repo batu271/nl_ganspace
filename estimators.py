@@ -14,6 +14,32 @@ import numpy as np
 import itertools
 from types import SimpleNamespace
 
+
+import torch
+import numpy as np
+
+class LatentEstimator:
+    def __init__(self, model, decomposition):
+        self.model = model
+        self.decomposition = decomposition
+
+    def estimate(self, latent, component_index, factors):
+        manipulated_latents = []
+        for factor in factors:
+            manipulated_latent = self.decomposition.manipulate(latent, component_index, factor)
+            manipulated_latents.append(manipulated_latent)
+        return np.array(manipulated_latents)
+
+    def generate_images(self, latent, component_index, factors):
+        manipulated_latents = self.estimate(latent, component_index, factors)
+        images = []
+        for manipulated_latent in manipulated_latents:
+            image = self.model.sample_np(z=[manipulated_latent])
+            images.append(image)
+        return np.array(images)
+
+
+
 # ICA
 class ICAEstimator():
     def __init__(self, n_components):
