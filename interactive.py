@@ -41,6 +41,30 @@ args = Config().from_args()
 # Don't bother without GPU
 assert torch.cuda.is_available(), 'Interactive mode requires CUDA'
 
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def visualize_latent_space(model, decomposition, latent, component_index, factors):
+    estimator = LatentEstimator(model, decomposition)
+    images = estimator.generate_images(latent, component_index, factors)
+
+    fig, axes = plt.subplots(1, len(factors), figsize=(20, 5))
+    for i, factor in enumerate(factors):
+        axes[i].imshow(images[i])
+        axes[i].set_title(f'Factor: {factor}')
+        axes[i].axis('off')
+    plt.show()
+
+
+
+
+
+
+
+
 # Use syntax from paper
 def get_edit_name(idx, s, e, name=None):
     return 'E({comp}, {edit_range}){edit_name}'.format(
