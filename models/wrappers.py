@@ -1,11 +1,22 @@
+# Copyright 2020 Erik Härkönen. All rights reserved.
+# This file is licensed to you under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License. You may obtain a copy
+# of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software distributed under
+# the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR REPRESENTATIONS
+# OF ANY KIND, either express or implied. See the License for the specific language
+# governing permissions and limitations under the License.
+
 import torch
-import torch.nn as nn
 import numpy as np
+import re
+import os
 import random
 from pathlib import Path
 from types import SimpleNamespace
-from .utils import download_ckpt
-from .config import Config
+from utils import download_ckpt
+from config import Config
 from netdissect import proggan, zdataset
 from . import biggan
 from . import stylegan
@@ -15,22 +26,33 @@ from functools import singledispatch
 
 class BaseModel(AbstractBaseClass, torch.nn.Module):
 
+    # Set parameters for identifying model from instance
     def __init__(self, model_name, class_name):
         super(BaseModel, self).__init__()
         self.model_name = model_name
         self.outclass = class_name
 
+    # Stop model evaluation as soon as possible after
+    # given layer has been executed, used to speed up
+    # netdissect.InstrumentedModel::retain_layer().
+    # Validate with tests/partial_forward_test.py
+    # Can use forward() as fallback at the cost of performance.
     @abstractmethod
     def partial_forward(self, x, layer_name):
         pass
 
+    # Generate batch of latent vectors
     @abstractmethod
     def sample_latent(self, n_samples=1, seed=None, truncation=None):
         pass
 
+    # Maximum number of latents that can be provided
+    # Typically one for each layer
     def get_max_latents(self):
         return 1
 
+    # Name of primary latent space
+    # E.g. StyleGAN can alternatively use W
     def latent_space_name(self):
         return 'Z'
 
@@ -43,10 +65,12 @@ class BaseModel(AbstractBaseClass, torch.nn.Module):
     def set_output_class(self, new_class):
         self.outclass = new_class
 
+    # Map from typical range [-1, 1] to [0, 1]
     def forward(self, x):
         out = self.model.forward(x)
         return 0.5*(out+1)
 
+    # Generate images and convert to numpy
     def sample_np(self, z=None, n_samples=1, seed=None):
         if z is None:
             z = self.sample_latent(n_samples, seed=seed)
@@ -58,72 +82,25 @@ class BaseModel(AbstractBaseClass, torch.nn.Module):
         img_np = img.permute(0, 2, 3, 1).cpu().detach().numpy()
         return np.clip(img_np, 0.0, 1.0).squeeze()
 
+    # For models that use part of latent as conditioning
     def get_conditional_state(self, z):
         return None
 
+    # For models that use part of latent as conditioning
     def set_conditional_state(self, z, c):
         return z
 
     def named_modules(self, *args, **kwargs):
         return self.model.named_modules(*args, **kwargs)
 
-# Define Deep Autoencoder
-class DeepAutoencoder(nn.Module):
-    def __init__(self, input_dim, encoding_dim):
-        super(DeepAutoencoder, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.ReLU(True),
-            nn.Linear(1024, 512),
-            nn.ReLU(True),
-            nn.Linear(512, 256),
-            nn.ReLU(True),
-            nn.Linear(256, encoding_dim),
-            nn.ReLU(True)
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(encoding_dim, 256),
-            nn.ReLU(True),
-            nn.Linear(256, 512),
-            nn.ReLU(True),
-            nn.Linear(512, 1024),
-            nn.ReLU(True),
-            nn.Linear(1024, input_dim),
-            nn.Tanh()
-        )
-
-    def forward(self, x):
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-        return encoded, decoded
-
-def train_autoencoder(latents, encoding_dim, num_epochs=1000, batch_size=32, learning_rate=1e-3):
-    autoencoder = DeepAutoencoder(latents.shape[1], encoding_dim).cuda()
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(autoencoder.parameters(), lr=learning_rate)
-
-    dataset = torch.utils.data.TensorDataset(torch.FloatTensor(latents))
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    for epoch in range(num_epochs):
-        for data in dataloader:
-            img = data[0].cuda()
-            encoded, decoded = autoencoder(img)
-            loss = criterion(decoded, img)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-    return autoencoder
-
+# PyTorch port of StyleGAN 2
 class StyleGAN2(BaseModel):
     def __init__(self, device, class_name, truncation=1.0, use_w=False):
         super(StyleGAN2, self).__init__('StyleGAN2', class_name or 'ffhq')
         self.device = device
         self.truncation = truncation
         self.latent_avg = None
-        self.w_primary = use_w  # use W as primary latent space?
-        self.autoencoder = None  # Initialize autoencoder attribute
+        self.w_primary = use_w # use W as primary latent space?
 
         # Image widths
         configs = {
@@ -158,6 +135,7 @@ class StyleGAN2(BaseModel):
     def use_z(self):
         self.w_primary = False
 
+    # URLs created with https://sites.google.com/site/gdocs2direct/
     def download_checkpoint(self, outfile):
         checkpoints = {
             'horse': 'https://drive.google.com/uc?export=download&id=18SkqWAkgt0fIwDEf2pqeaenNi4OoCo-0',
@@ -177,26 +155,26 @@ class StyleGAN2(BaseModel):
     def load_model(self):
         checkpoint_root = os.environ.get('GANCONTROL_CHECKPOINT_DIR', Path(__file__).parent / 'checkpoints')
         checkpoint = Path(checkpoint_root) / f'stylegan2/stylegan2_{self.outclass}_{self.resolution}.pt'
-
+        
         self.model = stylegan2.Generator(self.resolution, 512, 8).to(self.device)
 
         if not checkpoint.is_file():
             os.makedirs(checkpoint.parent, exist_ok=True)
             self.download_checkpoint(checkpoint)
-
+        
         ckpt = torch.load(checkpoint)
         self.model.load_state_dict(ckpt['g_ema'], strict=False)
         self.latent_avg = 0
 
     def sample_latent(self, n_samples=1, seed=None, truncation=None):
         if seed is None:
-            seed = np.random.randint(np.iinfo(np.int32).max)  # use (reproducible) global rand state
+            seed = np.random.randint(np.iinfo(np.int32).max) # use (reproducible) global rand state
 
         rng = np.random.RandomState(seed)
         z = torch.from_numpy(
-            rng.standard_normal(512 * n_samples)
-                .reshape(n_samples, 512)).float().to(self.device)  # [N, 512]
-
+                rng.standard_normal(512 * n_samples)
+                .reshape(n_samples, 512)).float().to(self.device) #[N, 512]
+        
         if self.w_primary:
             z = self.model.style(z)
 
@@ -208,12 +186,12 @@ class StyleGAN2(BaseModel):
     def set_output_class(self, new_class):
         if self.outclass != new_class:
             raise RuntimeError('StyleGAN2: cannot change output class without reloading')
-
+    
     def forward(self, x):
         x = x if isinstance(x, list) else [x]
         out, _ = self.model(x, noise=self.noise,
-                            truncation=self.truncation, truncation_latent=self.latent_avg, input_is_w=self.w_primary)
-        return 0.5 * (out + 1)
+            truncation=self.truncation, truncation_latent=self.latent_avg, input_is_w=self.w_primary)
+        return 0.5*(out+1)
 
     def partial_forward(self, x, layer_name):
         styles = x if isinstance(x, list) else [x]
@@ -224,9 +202,11 @@ class StyleGAN2(BaseModel):
             styles = [self.model.style(s) for s in styles]
 
         if len(styles) == 1:
+            # One global latent
             inject_index = self.model.n_latent
-            latent = self.model.strided_style(styles[0].unsqueeze(1).repeat(1, inject_index, 1))  # [N, 18, 512]
+            latent = self.model.strided_style(styles[0].unsqueeze(1).repeat(1, inject_index, 1)) # [N, 18, 512]
         elif len(styles) == 2:
+            # Latent mixing with two latents
             if inject_index is None:
                 inject_index = random.randint(1, self.model.n_latent - 1)
 
@@ -235,8 +215,9 @@ class StyleGAN2(BaseModel):
 
             latent = self.model.strided_style(torch.cat([latent, latent2], 1))
         else:
+            # One latent per layer
             assert len(styles) == self.model.n_latent, f'Expected {self.model.n_latents} latents, got {len(styles)}'
-            styles = torch.stack(styles, dim=1)  # [N, 18, 512]
+            styles = torch.stack(styles, dim=1) # [N, 18, 512]
             latent = self.model.strided_style(styles)
 
         if 'style' in layer_name:
@@ -258,18 +239,18 @@ class StyleGAN2(BaseModel):
         noise_i = 1
 
         for conv1, conv2, to_rgb in zip(
-                self.model.convs[::2], self.model.convs[1::2], self.model.to_rgbs
+            self.model.convs[::2], self.model.convs[1::2], self.model.to_rgbs
         ):
             out = conv1(out, latent[:, i], noise=noise[noise_i])
-            if f'convs.{i - 1}' in layer_name:
+            if f'convs.{i-1}' in layer_name:
                 return
 
             out = conv2(out, latent[:, i + 1], noise=noise[noise_i + 1])
             if f'convs.{i}' in layer_name:
                 return
-
+            
             skip = to_rgb(out, latent[:, i + 2], skip)
-            if f'to_rgbs.{i // 2}' in layer_name:
+            if f'to_rgbs.{i//2}' in layer_name:
                 return
 
             i += 2
@@ -287,7 +268,6 @@ class StyleGAN2(BaseModel):
             for _ in range(2):
                 self.noise.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=self.device))
 
-
 # PyTorch port of StyleGAN 1
 class StyleGAN(BaseModel):
     def __init__(self, device, class_name, truncation=1.0, use_w=False):
@@ -302,7 +282,7 @@ class StyleGAN(BaseModel):
             'bedrooms': 256,
             'cars': 512,
             'cats': 256,
-
+            
             # From https://github.com/justinpinkney/awesome-pretrained-stylegan
             'vases': 1024,
             'wikiart': 512,
@@ -333,7 +313,7 @@ class StyleGAN(BaseModel):
     def load_model(self):
         checkpoint_root = os.environ.get('GANCONTROL_CHECKPOINT_DIR', Path(__file__).parent / 'checkpoints')
         checkpoint = Path(checkpoint_root) / f'stylegan/stylegan_{self.outclass}_{self.resolution}.pt'
-
+        
         self.model = stylegan.StyleGAN_G(self.resolution).to(self.device)
 
         urls_tf = {
@@ -363,7 +343,7 @@ class StyleGAN(BaseModel):
                     download_ckpt(urls_tf[self.outclass], checkpoint_tf)
                 print('Converting TensorFlow checkpoint to PyTorch')
                 self.model.export_from_tf(checkpoint_tf)
-
+        
         self.model.load_weights(checkpoint)
 
     def sample_latent(self, n_samples=1, seed=None, truncation=None):
@@ -374,10 +354,10 @@ class StyleGAN(BaseModel):
         noise = torch.from_numpy(
                 rng.standard_normal(512 * n_samples)
                 .reshape(n_samples, 512)).float().to(self.device) #[N, 512]
-
+        
         if self.w_primary:
             noise = self.model._modules['g_mapping'].forward(noise)
-
+        
         return noise
 
     def get_max_latents(self):
@@ -482,7 +462,7 @@ class GANZooModel(BaseModel):
     def set_conditional_state(self, z, c):
         z[:, -20:] = c
         return z
-
+    
     def forward(self, x):
         out = self.base_model.test(x)
         return 0.5*(out+1)
@@ -505,7 +485,7 @@ class ProGAN(BaseModel):
     def load_model(self):
         checkpoint_root = os.environ.get('GANCONTROL_CHECKPOINT_DIR', Path(__file__).parent / 'checkpoints')
         checkpoint = Path(checkpoint_root) / f'progan/{self.outclass}_lsun.pth'
-
+        
         if not checkpoint.is_file():
             os.makedirs(checkpoint.parent, exist_ok=True)
             url = f'http://netdissect.csail.mit.edu/data/ganmodel/karras/{self.outclass}_lsun.pth'
@@ -523,7 +503,7 @@ class ProGAN(BaseModel):
         if isinstance(x, list):
             assert len(x) == 1, "ProGAN only supports a single global latent"
             x = x[0]
-
+        
         out = self.model.forward(x)
         return 0.5*(out+1)
 
@@ -559,12 +539,12 @@ class BigGAN(BaseModel):
     def load_model(self, name):        
         if name not in biggan.model.PRETRAINED_MODEL_ARCHIVE_MAP:
             raise RuntimeError('Unknown BigGAN model name', name)
-
+        
         checkpoint_root = os.environ.get('GANCONTROL_CHECKPOINT_DIR', Path(__file__).parent / 'checkpoints')
         model_path = Path(checkpoint_root) / name
 
         os.makedirs(model_path, exist_ok=True)
-
+        
         model_file = model_path / biggan.model.WEIGHTS_NAME
         config_file = model_path / biggan.model.CONFIG_NAME
         model_url = biggan.model.PRETRAINED_MODEL_ARCHIVE_MAP[name]
@@ -584,10 +564,10 @@ class BigGAN(BaseModel):
     def sample_latent(self, n_samples=1, truncation=None, seed=None):
         if seed is None:
             seed = np.random.randint(np.iinfo(np.int32).max) # use (reproducible) global rand state
-
+        
         noise_vector = biggan.truncated_noise_sample(truncation=truncation or self.truncation, batch_size=n_samples, seed=seed)
         noise = torch.from_numpy(noise_vector) #[N, 128] 
-
+        
         return noise.to(self.device)
 
     # One extra for gen_z
@@ -599,7 +579,7 @@ class BigGAN(BaseModel):
 
     def set_conditional_state(self, z, c):
         self.v_class = c
-
+    
     def is_valid_class(self, class_id):
         if isinstance(class_id, int):
             return class_id < 1000
@@ -617,7 +597,7 @@ class BigGAN(BaseModel):
             self.v_class = torch.from_numpy(biggan.one_hot_from_names([class_id])).to(self.device)
         else:
             raise RuntimeError(f'Unknown class identifier {class_id}')
-
+    
     def forward(self, x):        
         # Duplicate along batch dimension
         if isinstance(x, list):
@@ -648,7 +628,7 @@ class BigGAN(BaseModel):
         else:
             class_label = self.v_class.repeat(x[0].shape[0], 1)
             embed = len(x)*[self.model.embeddings(class_label)]
-
+        
         assert len(x) == self.model.n_latents, f'Expected {self.model.n_latents} latents, got {len(x)}'
         assert len(embed) == self.model.n_latents, f'Expected {self.model.n_latents} class vectors, got {len(class_label)}'
 
@@ -675,18 +655,18 @@ def get_model(name, output_class, device, **kwargs):
     # Check if optionally provided existing model can be reused
     inst = kwargs.get('inst', None)
     model = kwargs.get('model', None)
-
+    
     if inst or model:
         cached = model or inst.model
-
+        
         network_same = (cached.model_name == name)
         outclass_same = (cached.outclass == output_class)
         can_change_class = ('BigGAN' in name)
-
+        
         if network_same and (outclass_same or can_change_class):
             cached.set_output_class(output_class)
             return cached
-
+    
     if name == 'DCGAN':
         import warnings
         warnings.filterwarnings("ignore", message="nn.functional.tanh is deprecated")
@@ -731,7 +711,7 @@ def get_instrumented_model(name, output_class, layers, device, **kwargs):
             print(f"Layer '{layer_name}' not found in model!")
             print("Available layers:", '\n'.join(module_names))
             raise RuntimeError(f"Unknown layer '{layer_name}''")
-
+    
     # Reset StyleGANs to z mode for shape annotation
     if hasattr(model, 'use_z'):
         model.use_z()
@@ -755,31 +735,3 @@ def get_instrumented_model(name, output_class, layers, device, **kwargs):
 def _(cfg, device, **kwargs):
     kwargs['use_w'] = kwargs.get('use_w', cfg.use_w) # explicit arg can override cfg
     return get_instrumented_model(cfg.model, cfg.output_class, cfg.layer, device, **kwargs)
-
-
-
-
-
-
-    
-    # Additional methods to integrate autoencoder
-    def train_autoencoder(self, latents, encoding_dim, num_epochs=1000, batch_size=32, learning_rate=1e-3):
-        self.autoencoder = train_autoencoder(latents, encoding_dim, num_epochs, batch_size, learning_rate)
-
-    def encode_latents(self, latents):
-        latents = torch.FloatTensor(latents).cuda()
-        with torch.no_grad():
-            encoded, _ = self.autoencoder(latents)
-        return encoded.cpu().numpy()
-
-    def decode_latents(self, encoded_latents):
-        encoded_latents = torch.FloatTensor(encoded_latents).cuda()
-        with torch.no_grad():
-            _, decoded = self.autoencoder(encoded_latents)
-        return decoded.cpu().numpy()
-
-    def manipulate_latent(self, latent, principal_component, factor):
-        encoded_latent = self.encode_latents([latent])[0]
-        manipulated_encoded_latent = encoded_latent + factor * principal_component
-        manipulated_latent = self.decode_latents([manipulated_encoded_latent])[0]
-        return manipulated_latent
