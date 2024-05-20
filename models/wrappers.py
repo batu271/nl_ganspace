@@ -101,6 +101,10 @@ class StyleGAN2(BaseModel):
         self.truncation = truncation
         self.latent_avg = None
         self.w_primary = use_w # use W as primary latent space?
+        
+        self.class_name = class_name
+        self.use_w = use_w
+        self.autoencoder = None  # Placeholder for the autoencoder
 
         # Image widths
         configs = {
@@ -267,6 +271,74 @@ class StyleGAN2(BaseModel):
         for i in range(3, self.model.log_size + 1):
             for _ in range(2):
                 self.noise.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=self.device))
+
+    def sample_latent(self, n_samples=1, seed=None):
+        if seed is not None:
+            torch.manual_seed(seed)
+        return torch.randn(n_samples, 512).to(self.device)
+
+    def train_autoencoder(self, latents, encoding_dim, num_epochs=1000):
+        self.autoencoder = train_autoencoder(latents, encoding_dim, num_epochs)
+
+    def encode_latents(self, latents):
+        latents = torch.FloatTensor(latents).to(self.device)
+        with torch.no_grad():
+            encoded, _ = self.autoencoder(latents)
+        return encoded.cpu().numpy()
+
+    def decode_latents(self, encoded_latents):
+        encoded_latents = torch.FloatTensor(encoded_latents).to(self.device)
+        with torch.no_grad():
+            _, decoded = self.autoencoder(encoded_latents)
+        return decoded.cpu().numpy()
+
+class DeepAutoencoder(nn.Module):
+    def __init__(self, input_dim, encoding_dim):
+        super(DeepAutoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.ReLU(True),
+            nn.Linear(1024, 512),
+            nn.ReLU(True),
+            nn.Linear(512, 256),
+            nn.ReLU(True),
+            nn.Linear(256, encoding_dim),
+            nn.ReLU(True)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(encoding_dim, 256),
+            nn.ReLU(True),
+            nn.Linear(256, 512),
+            nn.ReLU(True),
+            nn.Linear(512, 1024),
+            nn.ReLU(True),
+            nn.Linear(1024, input_dim),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return encoded, decoded
+
+def train_autoencoder(latents, encoding_dim, num_epochs=1000, batch_size=32, learning_rate=1e-3):
+    autoencoder = DeepAutoencoder(latents.shape[1], encoding_dim).cuda()
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(autoencoder.parameters(), lr=learning_rate)
+
+    dataset = torch.utils.data.TensorDataset(torch.FloatTensor(latents))
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    for epoch in range(num_epochs):
+        for data in dataloader:
+            img = data[0].cuda()
+            encoded, decoded = autoencoder(img)
+            loss = criterion(decoded, img)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    return autoencoder
 
 # PyTorch port of StyleGAN 1
 class StyleGAN(BaseModel):
