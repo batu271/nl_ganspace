@@ -24,6 +24,8 @@ from . import stylegan2
 from abc import abstractmethod, ABC as AbstractBaseClass
 from functools import singledispatch
 
+import torch.nn as nn
+
 class BaseModel(AbstractBaseClass, torch.nn.Module):
 
     # Set parameters for identifying model from instance
